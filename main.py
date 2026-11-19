@@ -3,6 +3,9 @@ from re import search
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+import re
+import io
+from rank_bm25 import BM25Okapi
 
 import numpy as np
 import requests
@@ -36,34 +39,63 @@ async def ollama_down(_,exc):
 
 #-----Document preocessing------
 
-def extract_text(filename:str,data : bytes) ->str:
+import re
+import io
+from rank_bm25 import BM25Okapi
+
+# ---------- Document processing ----------
+
+def extract_pages(filename: str, data: bytes) -> list[tuple[int, str]]:
+    """Return a list of (page_number, text). Non-PDF files are one 'page'."""
     if filename.lower().endswith(".pdf"):
-        reader = PdfReader(io_bytes(data))
-        return "\n".join(page.extract_text() for page in reader.pages)
-    return data.decode("utf-8", errors="replace")
+        reader = PdfReader(io.BytesIO(data))
+        return [(i + 1, page.extract_text() or "") for i, page in enumerate(reader.pages)]
+    return [(1, data.decode("utf-8", errors="ignore"))]
 
-def io_bytes(data: bytes):
-    import io
-    return io.BytesIO(data)
 
-def chunk_text(text:str,size :int = 800, overlap:int = 150) -> list[str]:
-    chunks,start = [],0
-    while start < len(text):
-        chunks.append(text[start:start+size])
-        start += size - overlap
-    return [c.strip() for c in chunks if c.strip()]
+def chunk_pages(
+    pages: list[tuple[int, str]], size: int = 800, overlap: int = 150
+) -> list[dict]:
+    """Split each page into overlapping chunks, keeping page number and offsets."""
+    chunks = []
+    for page_no, text in pages:
+        text = re.sub(r"[ \t]+", " ", text).strip()
+        start = 0
+        while start < len(text):
+            piece = text[start:start + size].strip()
+            if piece:
+                chunks.append({
+                    "id": len(chunks),
+                    "page": page_no,
+                    "start": start,
+                    "text": piece,
+                })
+            start += size - overlap
+    return chunks
 
-#------Embediing and Retrievals------
 
-def embed(text: list[str]) -> np.ndarray:
-    vectors: list[list[float]] =  []
-    for i in range(0, len(text),64):
+# ---------- Tokenization for BM25 ----------
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
+    "in", "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was",
+    "were", "will", "with",
+}
+
+def tokenize(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", text.lower())
+    return [t for t in tokens if t not in STOPWORDS]
+
+
+# ---------- Embeddings ----------
+
+def embed(texts: list[str]) -> np.ndarray:
+    vectors: list[list[float]] = []
+    for i in range(0, len(texts), 64):
         r = requests.post(
             f"{OLLAMA_URL}/api/embed",
-            json = {
-                "model": EMBED_MODEL,
-                "input": text[i:i+64]
-            }
+            json={"model": EMBED_MODEL, "input": texts[i:i + 64]},
+            timeout=300,
         )
         r.raise_for_status()
         vectors.extend(r.json()["embeddings"])
@@ -71,11 +103,59 @@ def embed(text: list[str]) -> np.ndarray:
     return arr / np.linalg.norm(arr, axis=1, keepdims=True)
 
 
-def retrieve(query:str, docs: dict, k: int)-> list[tuple[int,float,str]]:
-    q = embed([query])[0]
-    scores = docs["vectors"] @ q
-    top = np.argsort(scores)[::-1][:k]
-    return [(int(i), float(scores[i]), docs["chunks"][i]) for i in top]
+# ---------- Hybrid retrieval (BM25 + vector, fused with RRF) ----------
+
+RRF_K = 60  # standard constant for Reciprocal Rank Fusion
+
+
+def build_indexes(chunks: list[dict]) -> dict:
+    """Build both the BM25 and vector indexes for a document."""
+    bm25 = BM25Okapi([tokenize(c["text"]) for c in chunks])
+    vectors = embed([c["text"] for c in chunks])
+    return {"bm25": bm25, "vectors": vectors}
+
+
+def hybrid_retrieve(query: str, doc: dict, k: int, candidates: int = 20):
+    chunks = doc["chunks"]
+
+    # 1. Keyword ranking (BM25)
+    bm25_scores = doc["bm25"].get_scores(tokenize(query))
+    bm25_rank = np.argsort(bm25_scores)[::-1][:candidates]
+
+    # 2. Semantic ranking (cosine similarity on normalized vectors)
+    q_vec = embed([query])[0]
+    vec_scores = doc["vectors"] @ q_vec
+    vec_rank = np.argsort(vec_scores)[::-1][:candidates]
+
+    # 3. Reciprocal Rank Fusion: score = sum(1 / (RRF_K + rank))
+    fused: dict[int, float] = {}
+    for rank, idx in enumerate(bm25_rank):
+        fused[int(idx)] = fused.get(int(idx), 0.0) + 1.0 / (RRF_K + rank + 1)
+    for rank, idx in enumerate(vec_rank):
+        fused[int(idx)] = fused.get(int(idx), 0.0) + 1.0 / (RRF_K + rank + 1)
+
+    top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:k]
+
+    results = []
+    for idx, rrf_score in top:
+        c = chunks[idx]
+        results.append({
+            "chunk_id": c["id"],
+            "page": c["page"],
+            "rrf_score": round(rrf_score, 4),
+            "bm25_score": round(float(bm25_scores[idx]), 3),
+            "vector_score": round(float(vec_scores[idx]), 3),
+            "text": c["text"],
+        })
+    return results
+
+
+def retrieve(query: str, doc: dict, k: int) -> list[tuple[int, float, str]]:
+    """Return ranked excerpts in the tuple format used by the ask endpoint."""
+    return [
+        (result["chunk_id"], result["rrf_score"], result["text"])
+        for result in hybrid_retrieve(query, doc, k)
+    ]
 
 #----- Web Search Tool-----
 
@@ -180,18 +260,22 @@ def upload_document(file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File size exceeds {MAX_UPLOAD_MB} MB limit.")
 
-    text = extract_text(name,data)
-    chunks = chunk_text(text)
+    pages = extract_pages(name, data)
+    chunks = chunk_pages(pages)
     if not chunks:
-        raise HTTPException(status_code=422, detail="No text could be extracted from the document.")
+        raise HTTPException(422, "No readable text found in this file (scanned PDF?)")
 
+    full_text = "\n\n".join(text for _, text in pages)
     doc_id = uuid.uuid4().hex[:12]
+    indexes = build_indexes(chunks)
+
     DOCS[doc_id] = {
         "name": name,
-        "text": text,
+        "text": full_text,
         "chunks": chunks,
-        "vectors": embed(chunks),
-        "uploaded_at": datetime.now(timezone.utc).isoformat(timespec ="seconds")
+        "bm25": indexes["bm25"],
+        "vectors": indexes["vectors"],
+        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
     }
     return doc_summary(doc_id)
 
